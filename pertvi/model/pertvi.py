@@ -1,26 +1,15 @@
 """Model class for pertVI for single cell expression data."""
 
 import logging
-import warnings
-from functools import partial
-from typing import Dict, Iterable, List, Optional, Sequence, Union
+from typing import List, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
-import math
 import torch
-import scanpy as sc
-from sklearn.neighbors import kneighbors_graph
-from scipy.spatial import Delaunay
-import pytorch_lightning as pl
 import torch.optim as optim
 from scvi import settings
 from tqdm import tqdm
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-from scipy.sparse import issparse
 from torch.distributions import Normal
-from torch.autograd import Variable as V
 
 from anndata import AnnData
 from scvi import REGISTRY_KEYS
@@ -37,18 +26,12 @@ from scvi.data.fields import (
 from scvi.dataloaders import AnnDataLoader
 from scvi.dataloaders._ann_dataloader import BatchSampler
 from scvi.dataloaders._anntorchdataset import AnnTorchDataset
-from scvi.model._utils import (
-    _get_batch_code_from_category,
-    _init_library_size,
-    scrna_raw_counts_properties,
-)
+from scvi.model._utils import _init_library_size
 from scvi.model.base import BaseModelClass, ArchesMixin
-from scvi.model.base._utils import _de_core
 from scvi.utils import setup_anndata_dsp
 from scvi.train import SemiSupervisedTrainingPlan, TrainRunner
-from scvi.dataloaders import DataSplitter, SemiSupervisedDataSplitter
+from scvi.dataloaders import SemiSupervisedDataSplitter
 from scvi.model._utils import parse_use_gpu_arg
-from scvi.dataloaders._data_splitting import validate_data_split
 
 
 from pertvi.module.pertvi import PertVIModule
@@ -315,30 +298,11 @@ class PertVIModel(BaseModelClass, ArchesMixin):
     
     def get_pert(
         adata,
-        pert_label = None,
-        drug_label = None,
-        dose_label = None,
-        ct_pert = None,
-        ct_drug = None,
-    ):
-        if pert_label is None:
-            df = pd.get_dummies(adata.obs[drug_label]) * 1
-            if dose_label is not None:
-                df = df * adata.obs[dose_label][:,None]
-            #df.iloc[adata.obs[drug_label]==ct_drug] = 0
-        elif drug_label is None:
-            df = pd.get_dummies(adata.obs[pert_label]) * 1
-            #df.iloc[adata.obs[pert_label]==ct_pert] = 0
-        else:
-            adata.obs['pert_drug'] = adata.obs[pert_label].astype(str) + adata.obs[drug_label].astype(str)
-            df = pd.get_dummies(adata.obs['pert_drug']) * 1
-            if dose_label is not None:
-                df = df * adata.obs[dose_label][:,None]
-            #df.iloc[adata.obs[drug_label]==ct_drug] = 0
-            #df.iloc[adata.obs[pert_label]==ct_pert] = 0        
-        adata.obsm['pert'] = df.values
-        return
-
+        cols
+    ):  
+        df = pd.get_dummies(adata.obs[cols].apply(lambda x: "_".join(x.astype(str)), 1), dtype=int)
+        df.columns = list(range(len(df.columns)))
+        adata.obsm["pert"] = df
     
     def train(
         self,
@@ -408,10 +372,7 @@ class PertVIModel(BaseModelClass, ArchesMixin):
     def query_base(
         self,
         adata_query,
-        model,
-        indices: Optional[Sequence[int]] = None,
-        batch_size: int = 128,
-        use_mask = False,
+        model
     ) -> None:
         adata_prepared = adata_query.copy()
         adata_prepared.obs_names_make_unique()
@@ -430,13 +391,8 @@ class PertVIModel(BaseModelClass, ArchesMixin):
         model,
         max_epochs: Optional[int] = 50,
         use_gpu: Optional[Union[str, int, bool]] = None,
-        indices: Optional[Sequence[int]] = None,
         batch_size: int = 128,
         use_mask = False,
-        early_stopping: bool = False,
-        train_size: float = 0.9,
-        validation_size: Optional[float] = None,
-        n_samples_per_label = 100,
         lr = 1e-3,
         weight_decay = 1e-4,
         **trainer_kwargs,
@@ -461,10 +417,6 @@ class PertVIModel(BaseModelClass, ArchesMixin):
         )
         
         tensors = AnnTorchDataset(self.get_anndata_manager(adata_prepared, required=True))
-        #dataloader = self._make_data_loader(adata=adata_prepared, indices=indices,batch_size=adata_prepared.shape[0],shuffle=False,pin_memory=pin_memory,data_loader_class=AnnDataLoader)
-        #for tensors in dataloader:
-        #    for ind in tensors:
-        #        tensors[ind] = tensors[ind].to(model.device)
         
         sampler_kwargs = {
             "indices": np.arange(adata_prepared.shape[0]),
@@ -478,7 +430,6 @@ class PertVIModel(BaseModelClass, ArchesMixin):
         
         p_m_ = torch.rand(adata_prepared.shape[0],self.module.n_output,requires_grad=True, device=model.device)
         p_v_ = torch.rand(adata_prepared.shape[0],self.module.n_output,requires_grad=True, device=model.device)
-        #p_m = p_m_ - 0.5
         
         self.module.freeze_params()
         
@@ -492,25 +443,13 @@ class PertVIModel(BaseModelClass, ArchesMixin):
             train_loss.append(train_query(self.module, tensors, sampler, p_m_, p_v_, optimizer, use_mask).detach())
             pbar.set_description('Epoch '+str(epoch)+'/'+str(max_epochs))
             pbar.set_postfix(train_loss=train_loss[epoch-1].cpu().numpy())
-            #print('Epoch ',epoch)
-            
                 
         model.module.eval()
         ## Now return trained p_m as the pert_embedding for the model
         p_m = torch.sign(p_m_-0.5) * (torch.clamp(torch.abs(p_m_-0.5),min=0.1)-0.1)
         p_m = p_m.detach().cpu().numpy()
-        #init_p_m = p_m - p_m.mean(axis=0)
-        #init_p_m = init_p_m / init_p_m.std(axis=0)
 
         base_rep = self.get_latent_representation(adata_prepared,representation_kind='base')
-        #pert_embedding = self.get_latent_representation(self.adata_manager.adata,representation_kind='pert')
-        #id_ind = np.abs(pert_embedding).sum(axis=0).copy()
-        #base_rep[:,id_ind>0] = base_rep[:,id_ind>0] - base_rep[:,id_ind>0].mean(axis=0)
-        #base_rep[:,id_ind>0] = base_rep[:,id_ind>0] / base_rep[:,id_ind>0].std(axis=0)
-        #base_rep[:,id_ind>0] = base_rep[:,id_ind>0] - init_p_m[:,id_ind>0] * (init_p_m[:,id_ind>0] * base_rep[:,id_ind>0]).sum(axis=0) / init_p_m.shape[0]
-        
-        #base_rep[:,id_ind==0] = base_rep[:,id_ind==0] + p_m[:,id_ind==0]
-        #p_m[:,id_ind==0] = 0
         
         return base_rep + p_m
     
@@ -545,7 +484,3 @@ def train_query(model, tensors, sampler, p_m_, p_v_, optimizer, use_mask):
         loss.backward(retain_graph=True)
         optimizer.step()
     return loss
-
-        
-        
-        
